@@ -1,0 +1,10 @@
+pettingzoo[butterfly]
+torch
+numpy
+pygame
+ray[rllib]
+SuperSuit
+dm_tree
+lz4
+gputil
+stable-baselines3
