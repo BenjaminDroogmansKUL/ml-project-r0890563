@@ -1,0 +1,55 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Packages ---
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+% --- Colors & Links ---
+\definecolor{facultyblue}{HTML}{0055A4} % adjust if you prefer a different blue
+\hypersetup{
+  colorlinks=true,
+  linkcolor=facultyblue,
+  urlcolor=facultyblue
+}
+
+% --- Metadata Macros (edit here) ---
+\newcommand{\InstructorNames}{Marra Giuseppe \& Meert Wannes}
+\newcommand{\CourseName}{Machine Learning: Project}
+\newcommand{\CourseCode}{H0T25a}
+\newcommand{\StudentName}{Benjamin Droogmans}
+\newcommand{\StudentID}{r0890563}
+\newcommand{\AcademicYear}{2024--2025}
+\newcommand{\FacultyLogo}{./figures/logo-firw-eng-tekst-blauw.png}
+
+% Optional PDF metadata
+\hypersetup{
+  pdftitle={\CourseName\ (\CourseCode) -- Project Report},
+  pdfauthor={\StudentName\ (\StudentID)},
+  pdfsubject={\CourseName\ Project},
+  pdfkeywords={Machine Learning, Project, \CourseCode}
+}
+
+\begin{document}
+
+% --- Front page ---
+\input{pages/titlepage}
+\input{pages/abstract}
+
+
+% --- (Optional) structure for the rest of the report ---
+\pagenumbering{roman}
+\tableofcontents
+\clearpage
+\pagenumbering{arabic}
+
+% Example content include (remove if you don't want placeholders)
+\input{content/introduction}
+
+\end{document}

@@ -1,0 +1,38 @@
+\begin{titlepage}
+\thispagestyle{empty}
+
+% Top accent bar
+{\color{facultyblue}\rule{\textwidth}{3pt}}
+
+\vspace{1.5em}
+
+% Logo (top-right)
+\begin{flushright}
+  \includegraphics[height=2.2cm]{\FacultyLogo}
+\end{flushright}
+
+% Title block
+\vspace*{1em}
+{\huge\bfseries \CourseName\par}
+\vspace{0.15em}
+{\Large\bfseries (\CourseCode)\par}
+
+\vspace{2.2em}
+
+% Info block
+\begingroup
+\setlength{\tabcolsep}{0pt}
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}p{3.6cm} l}
+\textbf{Instructors:}    & \InstructorNames \\
+\textbf{Student:}        & \StudentName\ (\StudentID) \\
+\textbf{Academic year:}  & \AcademicYear \\
+\end{tabular}
+\endgroup
+
+\vfill
+
+% Bottom accent bar
+{\color{facultyblue}\rule{\textwidth}{1.5pt}}
+
+\end{titlepage}
