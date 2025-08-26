@@ -52,7 +52,7 @@ def encode_state(
     A: int = 6,               # angle sectors
     B: int = 3,               # distance bins
     k: int = 4,               # number of slots
-    dy_thresholds=(-0.5, -0.1) # thresholds for dy binning
+    dy_thresholds=(-0.5, -0.2) # thresholds for dy binning
 ) -> Tuple[tuple, np.ndarray, list]:
     """
     Encode observation into discrete state for Q-learning.

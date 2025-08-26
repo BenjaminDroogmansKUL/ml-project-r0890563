@@ -31,10 +31,10 @@ def epsilon_greedy(q_values: np.ndarray, mask: np.ndarray, epsilon: float) -> in
 
 def train(
     output_dir: str = "results/tabq",
-    num_episodes: int = 200,
+    num_episodes: int = 10000,
     max_steps: int = 2000,
-    A: int = 6,
-    B: int = 3,
+    A: int = 4,
+    B: int = 5,
     gamma: float = 0.99,
     alpha: float = 0.5,
     epsilon: float = 1.0,
