@@ -1,0 +1,6 @@
+{
+  "A": 6,
+  "B": 3,
+  "gamma": 0.99,
+  "qtable_path": "results/tabq/qtable.npz"
+}
