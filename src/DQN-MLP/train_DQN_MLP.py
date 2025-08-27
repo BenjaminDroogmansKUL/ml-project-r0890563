@@ -247,22 +247,54 @@ class RunLogger:
             self._last_cum_env_steps = cum_env_steps
 
     def log_eval(self, iteration: int, result: Dict[str, Any]):
+        # Pull the evaluation section (present only when an eval was run this iter)
         eval_sec = result.get("evaluation") or {}
         er = eval_sec.get("env_runners") or {}
-        k = int(er.get("num_episodes", 0))
+        k = int(er.get("num_episodes", 0) or 0)
         if k <= 0:
             return
 
-        env_steps = _extract_env_steps(result)
+        # Team returns and episode length stats (from RLlib's eval env_runners section)
+        eval_return_mean = er.get("episode_return_mean", "")
+        eval_return_min  = er.get("episode_return_min", "")
+        eval_return_max  = er.get("episode_return_max", "")
+        eval_len_mean    = er.get("episode_len_mean", "")
+        eval_len_min     = er.get("episode_len_min", "")
+        eval_len_max     = er.get("episode_len_max", "")
+
+        # Agent-specific return (example: archer_0)
         agent_means = er.get("agent_episode_returns_mean", {}) or {}
-        mean_archer = agent_means.get("archer_0", "")
+        eval_return_archer_0 = agent_means.get("archer_0", "")
 
+        # Hist stats: per-episode returns and (optionally) seed IDs; compute std from the list
         hist = eval_sec.get("hist_stats", {}) or {}
-        ep_returns = hist.get("episode_reward", [])
-        ep_json = json.dumps(ep_returns) if isinstance(ep_returns, list) else "[]"
+        ep_returns = hist.get("episode_reward") or hist.get("episode_return") or []
+        if isinstance(ep_returns, list) and len(ep_returns) > 0:
+            try:
+                eval_return_std = float(np.std(ep_returns))
+            except Exception:
+                eval_return_std = ""
+        else:
+            eval_return_std = ""
+        episode_returns_json = json.dumps(ep_returns if isinstance(ep_returns, list) else [])
+        eval_seed_ids_json   = json.dumps(self._extract_eval_seeds(eval_sec))
 
+        # Training env step counters for traceability (lifetime + per-iter delta)
+        cum_env_steps   = self._extract_cum_env_steps(result)
+        delta_env_steps = self._extract_delta_env_steps(result)
+
+        # Append a row that matches the CSV header exactly.
         with open(self._eval_csv, "a", newline="") as f:
-            csv.writer(f).writerow([self.run_id, iteration, env_steps, k, mean_archer, "", ep_json])
+            csv.writer(f).writerow([
+                self.run_id, iteration,
+                k,
+                eval_return_mean, eval_return_min, eval_return_max, eval_return_std,
+                eval_len_mean, eval_len_min, eval_len_max,
+                eval_return_archer_0,
+                episode_returns_json, eval_seed_ids_json,
+                cum_env_steps if cum_env_steps is not None else "",
+                delta_env_steps if delta_env_steps is not None else "",
+            ])
 
     def log_checkpoint(self, iteration: int, result: Dict[str, Any], ckpt_path: str):
         cum_env_steps = self._extract_cum_env_steps(result)
