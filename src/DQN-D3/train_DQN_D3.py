@@ -325,6 +325,14 @@ EVAL_SEEDS = list(range(10_000, 10_000 + 200))  # plenty to cover multiple eval 
 EVAL_INTERVAL_ITERS = 5
 EVAL_EPISODES_PER_CHECKPOINT = 20  # K
 
+# Improvment over base parameter:
+D1_N_STEP = 3
+
+#D3 over D2 impr by prioritized replayu
+PER_ALPHA = 0.6
+PER_BETA = 0.4
+PER_EPS = 1e-6           #  epsilon added  priorities
+
 
 
 class CustomWrapper(BaseWrapper):
@@ -382,7 +390,7 @@ def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
 
 def algo_config(env_id: str, policies, policies_to_train):
     """
-    Minimal baseline DQN (uniform replay; Double/Dueling off).
+    D3 DQN
     """
     cfg = (
         DQNConfig()
@@ -407,14 +415,19 @@ def algo_config(env_id: str, policies, policies_to_train):
             train_batch_size=256,
             num_steps_sampled_before_learning_starts=5_000,
             target_network_update_freq=1000,
-            double_q=False,
+            double_q=True, # Improvement over D1
             dueling=False,
+            n_step=D1_N_STEP,   # Improvement over BASE
             replay_buffer_config={
                 "_enable_replay_buffer_api": True,
-                "type": "MultiAgentEpisodeReplayBuffer",
-                "capacity": 100_000,  #  original capacity
+                "type": "MultiAgentPrioritizedEpisodeReplayBuffer", #Still needs to be episodic to work.
+                "capacity": 100_000,  # same capacity as D2
                 "replay_sequence_length": 1,  # non-recurrent DQN
+                "prioritized_replay_alpha": PER_ALPHA,
+                "prioritized_replay_beta": PER_BETA,
+                "prioritized_replay_eps": PER_EPS,
             },
+
             # n_step default = 1
             epsilon=[[0, 1.0], [200_000, 0.01]],
         )
@@ -467,10 +480,10 @@ def training(checkpoint_path: str, max_iterations: int = 500):
         "eval_interval_iters": EVAL_INTERVAL_ITERS,
         "sticky_action_p": 0.25,
         "model": "MLP(64,64)",
-        "double_q": False,
+        "double_q": True, # Improvement over D1
         "dueling": False,
         "distributional": False,
-        "n_step": 1,
+        "n_step": D1_N_STEP, # Improvementover BASE
         "replay": "uniform",
         "replay_capacity": 100_000,
         "lr": 1e-4,

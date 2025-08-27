@@ -325,6 +325,8 @@ EVAL_SEEDS = list(range(10_000, 10_000 + 200))  # plenty to cover multiple eval 
 EVAL_INTERVAL_ITERS = 5
 EVAL_EPISODES_PER_CHECKPOINT = 20  # K
 
+# Improvment over base parameter:
+D1_N_STEP = 3
 
 
 class CustomWrapper(BaseWrapper):
@@ -407,8 +409,9 @@ def algo_config(env_id: str, policies, policies_to_train):
             train_batch_size=256,
             num_steps_sampled_before_learning_starts=5_000,
             target_network_update_freq=1000,
-            double_q=False,
+            double_q=True, # Improvement over D1
             dueling=False,
+            n_step=D1_N_STEP,   # Improvement over BASE
             replay_buffer_config={
                 "_enable_replay_buffer_api": True,
                 "type": "MultiAgentEpisodeReplayBuffer",
@@ -467,10 +470,10 @@ def training(checkpoint_path: str, max_iterations: int = 500):
         "eval_interval_iters": EVAL_INTERVAL_ITERS,
         "sticky_action_p": 0.25,
         "model": "MLP(64,64)",
-        "double_q": False,
+        "double_q": True, # Improvement over D1
         "dueling": False,
         "distributional": False,
-        "n_step": 1,
+        "n_step": D1_N_STEP, # Improvementover BASE
         "replay": "uniform",
         "replay_capacity": 100_000,
         "lr": 1e-4,

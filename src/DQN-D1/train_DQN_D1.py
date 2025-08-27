@@ -325,7 +325,8 @@ EVAL_SEEDS = list(range(10_000, 10_000 + 200))  # plenty to cover multiple eval 
 EVAL_INTERVAL_ITERS = 5
 EVAL_EPISODES_PER_CHECKPOINT = 20  # K
 
-
+# Improvment over base parameter:
+D1_N_STEP = 3
 
 class CustomWrapper(BaseWrapper):
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
@@ -409,6 +410,7 @@ def algo_config(env_id: str, policies, policies_to_train):
             target_network_update_freq=1000,
             double_q=False,
             dueling=False,
+            n_step=D1_N_STEP,   # Improvement over BASE
             replay_buffer_config={
                 "_enable_replay_buffer_api": True,
                 "type": "MultiAgentEpisodeReplayBuffer",
@@ -470,7 +472,7 @@ def training(checkpoint_path: str, max_iterations: int = 500):
         "double_q": False,
         "dueling": False,
         "distributional": False,
-        "n_step": 1,
+        "n_step": D1_N_STEP, # Improvement
         "replay": "uniform",
         "replay_capacity": 100_000,
         "lr": 1e-4,
