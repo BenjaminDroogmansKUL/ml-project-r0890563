@@ -423,9 +423,9 @@ def algo_config(env_id: str, policies, policies_to_train):
                 "type": "MultiAgentPrioritizedEpisodeReplayBuffer", #Still needs to be episodic to work.
                 "capacity": 100_000,  # same capacity as D2
                 "replay_sequence_length": 1,  # non-recurrent DQN
-                "prioritized_replay_alpha": PER_ALPHA,
-                "prioritized_replay_beta": PER_BETA,
-                "prioritized_replay_eps": PER_EPS,
+                "alpha": PER_ALPHA,
+                "beta": PER_BETA,
+                "eps": PER_EPS,
             },
 
             # n_step default = 1
