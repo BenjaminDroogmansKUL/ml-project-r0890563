@@ -34,6 +34,9 @@ from utils import create_environment
 from sticky_wrapper import StickyActionWrapper
 from seed_cycle_wrapper import SeedCycleWrapper
 
+import supersuit as ss
+
+
 import csv, json, os, time, datetime
 from typing import Dict, Any, List, Optional
 
@@ -312,7 +315,7 @@ class RunLogger:
 
 # Choose your N external run seeds (you will pass these in one-by-one as GLOBAL_SEED).
 # Example you can use: [111, 222, 333, 444, 555]
-GLOBAL_SEED = 111  # <-- change per run (N=5 runs total)
+GLOBAL_SEED = 222  # <-- change per run (N=5 runs total)
 
 # TRAIN seeds (cycled by SeedCycleWrapper during training).
 TRAIN_SEEDS = list(range(0, 1000))
@@ -325,18 +328,171 @@ EVAL_SEEDS = list(range(10_000, 10_000 + 200))  # plenty to cover multiple eval 
 EVAL_INTERVAL_ITERS = 5
 EVAL_EPISODES_PER_CHECKPOINT = 20  # K
 
+# Improvment over base parameter:
+D1_N_STEP = 3
+
+#D3 over D2 impr by prioritized replayu
+PER_ALPHA = 0.6
+PER_BETA = 0.4
+PER_EPS = 1e-6           #  epsilon added  priorities
+
+# D4 over D3, distributional
+D4_NUM_ATOMS = 51
+D4_V_MIN = -20.0
+D4_V_MAX =  20.0
+
+# ---- FULL setup toggles ----
+FULL_DUELING = True          # turn dueling streams ON
+FULL_USE_LSTM = True         # set to False if you want a non-recurrent "full" ablation
+
+# LSTM (only used if FULL_USE_LSTM=True)
+FULL_LSTM_CELL_SIZE = 96    #drastically smaller
+FULL_LSTM_USE_PREV_ACTION = True
+FULL_LSTM_USE_PREV_REWARD = True
+FULL_REPLAY_SEQUENCE_LENGTH = 32     # length of sequences sampled from the buffer
+FULL_REPLAY_BURN_IN = 10             # prefix timesteps used to warm the hidden state
+
+# (we reuse your existing D4 settings for num_atoms/v_min/v_max and D1’s n_step)
+
+
+class AngularAugmentAECWrapper(BaseWrapper):
+    """
+    Assumes base obs is a small matrix where:
+      row 0: [archer_x, archer_y, <unused>, hx, hy]
+      zombie rows: [dist, dx, dy, <unused>, <unused>]
+    If your base layout differs, adapt the column indices below.
+    """
+    def __init__(self, env, k_nearest=5, coord_scale=200.0):
+        """
+        k_nearest: number of zombies to encode
+        coord_scale: scale used by tanh-normalization for x,y,dx,dy,dist
+        """
+        super().__init__(env)
+        self.k = k_nearest
+        self.scale = float(coord_scale)
+
+        # Archer: [x_tanh, y_tanh, hx, hy] -> 4
+        # Each zombie: [dist_tanh, dx_tanh, dy_tanh, cosΔ, sinΔ, Δθ/π] -> 6
+        self._feat_dim = 4 + self.k * 6
+
+        # Keep obs finite and normalized to [-1, 1]
+        self._obs_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(self._feat_dim,), dtype=np.float32
+        )
+
+    def observation_space(self, agent):
+        return self._obs_space
+
+    # --- helpers ---
+    def _tanh_norm(self, v):
+        return np.tanh(v / self.scale, dtype=np.float32)
+
+    def _safe_unit(self, v):
+        n = np.linalg.norm(v)
+        return v / n if n > 1e-8 else np.array([1.0, 0.0], dtype=np.float32)
+
+    def _build_features(self, raw_obs):
+        """
+        raw_obs expected shape ~ (rows, 5).
+        row 0: archer: [x, y, ?, hx, hy]
+        zombie rows: [dist, dx, dy, ?, ?]
+        """
+        # --- Archer base features ---
+        ax, ay, _, hx, hy = raw_obs[0].astype(np.float32)
+        h = self._safe_unit(np.array([hx, hy], dtype=np.float32))
+
+        # normalize pos; if you know world size, swap tanh for linear scaling
+        archer_feats = np.array([
+            self._tanh_norm(ax),
+            self._tanh_norm(ay),
+            h[0], h[1],
+        ], dtype=np.float32)
+
+        # --- Collect candidate zombie rows ---
+        if raw_obs.shape[0] > 1:
+            zombies = raw_obs[1:]  # everything after row 0
+        else:
+            zombies = np.zeros((0, raw_obs.shape[1]), dtype=np.float32)
+
+        # compute distances from dx, dy (more robust than trusting provided 'dist')
+        if len(zombies) > 0:
+            dx = zombies[:, 1].astype(np.float32)
+            dy = zombies[:, 2].astype(np.float32)
+            d = np.sqrt(dx*dx + dy*dy, dtype=np.float32)
+            order = np.argsort(d)  # nearest first
+            zombies = zombies[order]
+            dx = dx[order]; dy = dy[order]; d = d[order]
+        else:
+            dx = dy = d = np.array([], dtype=np.float32)
+
+        # pad/truncate to k
+        K = self.k
+        if len(d) < K:
+            pad_n = K - len(d)
+            dx = np.concatenate([dx, np.zeros(pad_n, dtype=np.float32)])
+            dy = np.concatenate([dy, np.zeros(pad_n, dtype=np.float32)])
+            d  = np.concatenate([d,  np.zeros(pad_n, dtype=np.float32)])
+        elif len(d) > K:
+            dx = dx[:K]; dy = dy[:K]; d = d[:K]
+
+        # build per-zombie features
+        z_feats = []
+        for i in range(K):
+            v = np.array([dx[i], dy[i]], dtype=np.float32)
+            vhat = self._safe_unit(v)
+            cos_d = float(h @ vhat)
+            # 2D "cross z" for signed angle
+            sin_d = float(h[0]*vhat[1] - h[1]*vhat[0])
+            ang = np.arctan2(sin_d, cos_d) / np.pi  # in (-1, 1]
+
+            z_feats.extend([
+                self._tanh_norm(d[i]),
+                self._tanh_norm(dx[i]),
+                self._tanh_norm(dy[i]),
+                np.float32(cos_d),
+                np.float32(sin_d),
+                np.float32(ang),
+            ])
+
+        return np.concatenate([archer_feats, np.array(z_feats, dtype=np.float32)], axis=0)
+
+    # --- PettingZoo API overrides ---
+    def observe(self, agent):
+        raw = super().observe(agent)
+        if raw is None:
+            return None
+
+        # If earlier wrappers already sliced rows/cols, adapt here.
+        # Expecting shape (rows, 5). If it's flat, try to reshape.
+        if raw.ndim == 1 and raw.size % 5 == 0:
+            raw = raw.reshape((-1, 5))
+        assert raw.ndim == 2 and raw.shape[1] >= 5, \
+            f"Expected (rows, >=5), got {raw.shape}"
+
+        feats = self._build_features(raw)
+        return feats.astype(np.float32, copy=False)
 
 
 class CustomWrapper(BaseWrapper):
-    # Keep vector observations flattened; DQN requires a fixed-size tensor.
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
+        # New obs is 5 rows x 5 cols = 25 long when flattened
+        base_space = super().observation_space(agent)
+        sub_space = spaces.Box(low=base_space.low.min(),
+                               high=base_space.high.max(),
+                               shape=(25,),
+                               dtype=np.float32)
+        return sub_space
 
     def observe(self, agent: AgentID) -> ObsType | None:
         obs = super().observe(agent)
-        flat_obs = obs.flatten()
-        return flat_obs
+        if obs is None:
+            return None
 
+        # Keep only first row (archer) + last 4 rows (zombies)
+        obs = obs[[0, -4, -3, -2, -1], :]   # shape (5,5)
+
+        flat_obs = obs.flatten().astype(np.float32, copy=False)  # shape (25,)
+        return flat_obs
 
 
 class CustomPredictFunction(Callable):
@@ -359,15 +515,17 @@ class CustomPredictFunction(Callable):
 
 
 def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
-    """
-    mode: "train" or "eval"
-    - Both modes use the same wrappers (StickyActionWrapper + CustomWrapper),
-      but cycle through different seed pools via SeedCycleWrapper.
-    """
     base = create_environment(num_agents=num_agents, visual_observation=visual_observation)
-    base = StickyActionWrapper(base, p_sticky=0.25)   # same stochasticity in both train & eval
-    base = CustomWrapper(base)
+    # (Optional but recommended) keep agent set constant for vectorized training:
+    base = ss.black_death_v3(base)
 
+    # Keep your sticky action stochasticity if you like
+    base = StickyActionWrapper(base, p_sticky=0.25)
+
+    # >>> Replace your CustomWrapper with the angular one <<<
+    base = AngularAugmentAECWrapper(base, k_nearest=5, coord_scale=200.0)
+
+    # Seeds, etc.
     if mode == "train":
         base = SeedCycleWrapper(base, seed_list=TRAIN_SEEDS)
     elif mode == "eval":
@@ -375,15 +533,31 @@ def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
     else:
         raise ValueError(f"Unknown env mode: {mode}")
 
-    # RLlib needs a ParallelPettingZooEnv wrapper
-    return ParallelPettingZooEnv(pettingzoo.utils.conversions.aec_to_parallel(base))
+    # Convert AEC → parallel for RLlib
+    from pettingzoo.utils.conversions import aec_to_parallel
+    from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
+    return ParallelPettingZooEnv(aec_to_parallel(base))
 
 
 
 def algo_config(env_id: str, policies, policies_to_train):
     """
-    Minimal baseline DQN (uniform replay; Double/Dueling off).
+    D3 DQN
     """
+
+    model_cfg = {
+        "fcnet_hiddens": [128],
+    }
+
+    if FULL_USE_LSTM:
+        model_cfg.update({
+            "use_lstm": True,
+            "lstm_cell_size": FULL_LSTM_CELL_SIZE,
+            "lstm_use_prev_action": FULL_LSTM_USE_PREV_ACTION,
+            "lstm_use_prev_reward": FULL_LSTM_USE_PREV_REWARD,
+            "max_seq_len": FULL_REPLAY_SEQUENCE_LENGTH,
+        })
+
     cfg = (
         DQNConfig()
         .api_stack(
@@ -392,7 +566,8 @@ def algo_config(env_id: str, policies, policies_to_train):
         )
         .environment(env=env_id, disable_env_checking=True, env_config={"mode": "train"})
         .env_runners(
-            num_env_runners=1,
+            num_env_runners=4,
+            num_envs_per_env_runner=4,
             rollout_fragment_length=64  # simple at first
         )
         .multi_agent(
@@ -400,20 +575,32 @@ def algo_config(env_id: str, policies, policies_to_train):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=policies_to_train,
         )
-        .rl_module(model_config={"fcnet_hiddens": [64, 64]})
+        .rl_module(model_config={"fcnet_hiddens": [128]})
         .training(
             lr=1e-4,
             gamma=0.99,
-            train_batch_size=256,
+            train_batch_size=16000, #massively increase
             num_steps_sampled_before_learning_starts=5_000,
             target_network_update_freq=1000,
-            double_q=False,
-            dueling=False,
+            double_q=True, # Improvement over D1
+            dueling=FULL_DUELING,
+            n_step=D1_N_STEP,   # Improvement over BASE
+            num_atoms=D4_NUM_ATOMS, # improvement over d3 for distr
+            v_min=D4_V_MIN,
+            v_max=D4_V_MAX,
             replay_buffer_config={
-                "type": "MultiAgentEpisodeReplayBuffer",
-                "capacity": 100_000,
+                "_enable_replay_buffer_api": True,
+                "type": "MultiAgentPrioritizedEpisodeReplayBuffer", #Still needs to be episodic to work.
+                "capacity": 100_000,  # same capacity as D2
+                "replay_sequence_length": FULL_REPLAY_SEQUENCE_LENGTH if FULL_USE_LSTM else 1,  # non-recurrent DQN
+                "alpha": PER_ALPHA,
+                "beta": PER_BETA,
+                "eps": PER_EPS,
             },
+            grad_clip= 40.0,
+
             # n_step default = 1
+            #epsilon=[[0, 1.0], [200_000, 0.01]],
         )
         # Built-in evaluation
         .evaluation(
@@ -463,12 +650,20 @@ def training(checkpoint_path: str, max_iterations: int = 500):
         "eval_episodes_per_checkpoint": EVAL_EPISODES_PER_CHECKPOINT,
         "eval_interval_iters": EVAL_INTERVAL_ITERS,
         "sticky_action_p": 0.25,
-        "model": "MLP(64,64)",
-        "double_q": False,
-        "dueling": False,
-        "distributional": False,
-        "n_step": 1,
-        "replay": "uniform",
+        "model": "MLP(64,64)" + (" + LSTM" if FULL_USE_LSTM else ""),
+        "double_q": True, # Improvement over D1
+        "dueling": FULL_DUELING,
+        "v_min": D4_V_MIN,
+        "v_max": D4_V_MAX,
+        "distributional": True,     #improvement over D3
+        "num_atoms": D4_NUM_ATOMS,  #  D4 params
+        "n_step": D1_N_STEP, # Improvementover BASE
+        "use_lstm": FULL_USE_LSTM,
+        "lstm_cell_size": FULL_LSTM_CELL_SIZE if FULL_USE_LSTM else None,
+        "lstm_use_prev_action": FULL_LSTM_USE_PREV_ACTION if FULL_USE_LSTM else None,
+        "lstm_use_prev_reward": FULL_LSTM_USE_PREV_REWARD if FULL_USE_LSTM else None,
+        "replay_sequence_length": FULL_REPLAY_SEQUENCE_LENGTH if FULL_USE_LSTM else 1,
+        "replay": "PER",
         "replay_capacity": 100_000,
         "lr": 1e-4,
         "gamma": 0.99,
@@ -498,10 +693,10 @@ def training(checkpoint_path: str, max_iterations: int = 500):
             print(f"[seed={GLOBAL_SEED}] iter={i} EVAL: archer_0_mean={mean_archer} over {k_episodes} episodes")
             logger.log_eval(i, result)
 
-        if train_metrics and "archer_0" in train_metrics:
-            if train_metrics["archer_0"] > 5:
-                print(f"[seed={GLOBAL_SEED}] Early stop at iter={i} (archer_0 > 5).")
-                break
+        #if train_metrics and "archer_0" in train_metrics:
+        #    if train_metrics["archer_0"] > 5:
+        #        print(f"[seed={GLOBAL_SEED}] Early stop at iter={i} (archer_0 > 5).")
+        #        break
 
         if i % 5 == 0:
             save_result = algo.save(checkpoint_path)
@@ -513,4 +708,4 @@ def training(checkpoint_path: str, max_iterations: int = 500):
 
 if __name__ == "__main__":
     checkpoint_path = str(Path("results").resolve())
-    training(checkpoint_path, max_iterations=500)
+    training(checkpoint_path, max_iterations=20000)
