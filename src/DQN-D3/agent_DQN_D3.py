@@ -26,17 +26,25 @@ from ray.rllib.core.rl_module import MultiRLModule
 from sticky_wrapper import StickyActionWrapper
 
 class CustomWrapper(BaseWrapper):
-    """Flattens the symbolic vector state of the environment.
-
-    IMPORTANT: Use the same (or a consistent) wrapper as in training.
-    """
-
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
+        # New obs is 5 rows x 5 cols = 25 long when flattened
+        base_space = super().observation_space(agent)
+        sub_space = spaces.Box(low=base_space.low.min(),
+                               high=base_space.high.max(),
+                               shape=(25,),
+                               dtype=np.float32)
+        return sub_space
 
-    def observe(self, agent: AgentID) -> Optional[ObsType]:
+    def observe(self, agent: AgentID) -> ObsType | None:
         obs = super().observe(agent)
-        flat_obs = obs.flatten()
+        if obs is None:
+            return None
+
+        # Keep only first row (archer) + last 4 rows (zombies)
+        obs = obs[[0, -4, -3, -2, -1], :]   # shape (5,5)
+        print(obs)
+
+        flat_obs = obs.flatten().astype(np.float32, copy=False)  # shape (25,)
         return flat_obs
 
 
@@ -69,7 +77,8 @@ class CustomPredictFunction:
 
         with torch.no_grad():
             fwd_out = rl_module.forward_inference({"obs": obs_tensor})
-            q_values = fwd_out["q_values"]
-            action = int(torch.argmax(q_values, dim=1).item())
+            #q_values = fwd_out["q_values"]
+            #print(fwd_out)
+            action = int(fwd_out["actions"])
 
         return action

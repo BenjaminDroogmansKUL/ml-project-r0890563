@@ -33,280 +33,12 @@ from ray.tune.registry import register_env
 from utils import create_environment
 from sticky_wrapper import StickyActionWrapper
 from seed_cycle_wrapper import SeedCycleWrapper
+from survival_bonus_wrapper import SurvivalBonusAECWrapper
+from angular_zombie_wrapper import AngularZombieWrapper
+from flatten_wrapper import FlattenWrapper
+from only_zombies_wrapper import OnlyZombiesWrapper
 
-import csv, json, os, time, datetime
-from typing import Dict, Any, List, Optional
-
-def _extract_env_steps(result: Dict[str, Any]) -> Optional[int]:
-    # Try common fields across RLlib new/old summaries
-    return (
-        result.get("env_steps_sampled")
-        or result.get("num_env_steps_sampled")
-        or result.get("timesteps_total")
-        or result.get("counters", {}).get("env_steps_sampled")
-        or result.get("env_runners", {}).get("env_steps_sampled")
-    )
-
-
-class RunLogger:
-    def __init__(self, base_dir: str, global_seed: int, algo_name: str, meta: Dict[str, Any]):
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.run_id = f"{algo_name.lower()}_kaz_{ts}_seed{global_seed}"
-        self.dir = os.path.join(base_dir, "metrics", self.run_id)
-        os.makedirs(self.dir, exist_ok=True)
-
-        # meta file
-        meta_out = {"run_id": self.run_id, "global_seed": global_seed, "algo": algo_name}
-        meta_out.update(meta)
-        with open(os.path.join(self.dir, "run_meta.json"), "w") as f:
-            json.dump(meta_out, f, indent=2)
-
-        # csv headers (iteration-first)
-        self._train_csv = os.path.join(self.dir, "train_log.csv")
-        with open(self._train_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "run_id", "iter",
-                "time_this_iter_s", "time_total_s",
-                "delta_env_steps", "cum_env_steps", "episodes_this_iter", "throughput_steps_per_s",
-                "train_episode_return_mean", "train_episode_return_min", "train_episode_return_max",
-                "train_episode_len_mean", "train_episode_len_min", "train_episode_len_max",
-                "train_return_archer_0", "train_return_mean_all_agents",
-                "total_loss", "td_error_mean", "qf_mean", "qf_min", "qf_max",
-                "num_target_updates", "last_target_update_ts",
-                "grad_norm", "lr", "module_train_batch_size_mean",
-                "rb_env_steps_added", "rb_env_steps_sampled", "rb_env_step_utilization",
-                "rb_env_steps_stored", "rb_episodes_stored", "rb_evicted_steps_lifetime",
-                "cpu_util_percent", "ram_util_percent"
-            ])
-
-        self._eval_csv = os.path.join(self.dir, "eval_log.csv")
-        with open(self._eval_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "run_id", "iter",
-                "eval_k_episodes",
-                "eval_return_mean", "eval_return_min", "eval_return_max", "eval_return_std",
-                "eval_len_mean", "eval_len_min", "eval_len_max",
-                "eval_return_archer_0",
-                "episode_returns_json", "eval_seed_ids_json",
-                "cum_env_steps", "delta_env_steps"
-            ])
-
-        self._ckpt_csv = os.path.join(self.dir, "checkpoints.csv")
-        with open(self._ckpt_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["run_id", "iter", "checkpoint_path", "cum_env_steps"])
-
-        self._t0 = time.time()
-        self._last_cum_env_steps = 0  # for delta fallback if per-iter steps are absent
-
-    # ---------- helpers ----------
-    @staticmethod
-    def _safe_float(x: Any) -> Any:
-        try:
-            return float(x)
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _get(env: Dict[str, Any], path: List[str], default=None):
-        cur = env
-        for k in path:
-            if not isinstance(cur, dict) or k not in cur:
-                return default
-            cur = cur[k]
-        return cur
-
-    def _extract_cum_env_steps(self, result: Dict[str, Any]) -> Optional[int]:
-        # Prefer explicit lifetime counters; fallback to older RLlib fields
-        for path in [
-            ["num_env_steps_sampled_lifetime"],
-            ["env_runners", "num_env_steps_sampled_lifetime"],
-            ["timesteps_total"],  # older field name
-            ["counters", "env_steps_sampled"],  # very old fallback
-        ]:
-            v = self._get(result, path)
-            if isinstance(v, (int, float)) and v is not None:
-                return int(v)
-        return None
-
-    def _extract_delta_env_steps(self, result: Dict[str, Any]) -> Optional[int]:
-        # Prefer per-iteration steps if available; else compute via lifetime diff
-        v = self._get(result, ["env_runners", "num_env_steps_sampled"])
-        if isinstance(v, (int, float)):
-            return int(v)
-        cum = self._extract_cum_env_steps(result)
-        if cum is not None and isinstance(self._last_cum_env_steps, (int, float)):
-            delta = int(cum - (self._last_cum_env_steps or 0))
-            return max(delta, 0)
-        return None
-
-    @staticmethod
-    def _mean_of_numeric_dict_values(d: Dict[str, Any]) -> Optional[float]:
-        if not isinstance(d, dict) or not d:
-            return None
-        vals = [float(v) for v in d.values() if isinstance(v, (int, float, np.floating))]
-        return float(np.mean(vals)) if vals else None
-
-    @staticmethod
-    def _first_learner_key(learners: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(learners, dict):
-            return None
-        for k in learners.keys():
-            if k != "__all_modules__":
-                return k
-        return None
-
-    @staticmethod
-    def _extract_eval_seeds(eval_sec: Dict[str, Any]) -> List[Any]:
-        # Try to find any hist_stats entry that looks like seeds (e.g., "episode_seed" or "seed")
-        hist = eval_sec.get("hist_stats", {}) or {}
-        for key, val in hist.items():
-            if isinstance(key, str) and "seed" in key.lower() and isinstance(val, list):
-                return val
-        return []
-
-    def log_train(self, iteration: int, result: Dict[str, Any]):
-        # Timing
-        time_this_iter_s = self._safe_float(result.get("time_this_iter_s"))
-        time_total_s = self._safe_float(result.get("time_total_s"))
-
-        # Steps & episodes
-        cum_env_steps = self._extract_cum_env_steps(result)
-        delta_env_steps = self._extract_delta_env_steps(result)
-        episodes_this_iter = self._get(result, ["env_runners", "num_episodes"])
-        throughput = ""
-        if isinstance(delta_env_steps, (int, float)) and isinstance(time_this_iter_s, float) and time_this_iter_s > 0:
-            throughput = float(delta_env_steps) / time_this_iter_s
-
-        # Train returns/lengths
-        er = result.get("env_runners", {}) or {}
-        train_team_mean = er.get("episode_return_mean", "")
-        train_team_min = er.get("episode_return_min", "")
-        train_team_max = er.get("episode_return_max", "")
-        train_len_mean = er.get("episode_len_mean", "")
-        train_len_min = er.get("episode_len_min", "")
-        train_len_max = er.get("episode_len_max", "")
-        agent_means = er.get("agent_episode_returns_mean", {}) or {}
-        train_archer = agent_means.get("archer_0", "")
-        train_agents_overall = self._mean_of_numeric_dict_values(agent_means)
-
-        # Learner metrics (pick first actual module, plus some __all_modules__ fields)
-        learners = result.get("learners", {}) or {}
-        lm_key = self._first_learner_key(learners)
-        lm = learners.get(lm_key, {}) if lm_key else {}
-        total_loss = lm.get("total_loss", "")
-        td_error_mean = lm.get("td_error_mean", "")
-        qf_mean = lm.get("qf_mean", "")
-        qf_min = lm.get("qf_min", "")
-        qf_max = lm.get("qf_max", "")
-        num_target_updates = lm.get("num_target_updates", "")
-        last_target_update_ts = lm.get("last_target_update_ts", "")
-        grad_norm = lm.get("gradients_default_optimizer_global_norm", "")
-        lr = lm.get("default_optimizer_learning_rate", "")
-        module_train_batch_size_mean = lm.get("module_train_batch_size_mean", "")
-        # Some totals under __all_modules__ (keep as-is if you want; not critical to CSV)
-
-        # Replay buffer metrics
-        rb = result.get("replay_buffer", {}) or {}
-        rb_env_steps_added = rb.get("num_env_steps_added", "")
-        rb_env_steps_sampled = rb.get("num_env_steps_sampled", "")
-        rb_util = rb.get("env_step_utilization", "")
-        rb_env_steps_stored = rb.get("num_env_steps_stored", "")
-        rb_episodes_stored = rb.get("num_episodes_stored", "")
-        rb_evicted_steps_lifetime = rb.get("num_env_steps_evicted_lifetime", "")
-
-        # System perf
-        perf = result.get("perf", {}) or {}
-        cpu = perf.get("cpu_util_percent", "")
-        ram = perf.get("ram_util_percent", "")
-
-        with open(self._train_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                self.run_id, iteration,
-                time_this_iter_s, time_total_s,
-                delta_env_steps if delta_env_steps is not None else "",
-                cum_env_steps if cum_env_steps is not None else "",
-                episodes_this_iter if episodes_this_iter is not None else "",
-                throughput if throughput != "" else "",
-                train_team_mean, train_team_min, train_team_max,
-                train_len_mean, train_len_min, train_len_max,
-                train_archer,
-                train_agents_overall if train_agents_overall is not None else "",
-                total_loss, td_error_mean, qf_mean, qf_min, qf_max,
-                num_target_updates, last_target_update_ts,
-                grad_norm, lr, module_train_batch_size_mean,
-                rb_env_steps_added, rb_env_steps_sampled, rb_util,
-                rb_env_steps_stored, rb_episodes_stored, rb_evicted_steps_lifetime,
-                self._safe_float(cpu), self._safe_float(ram),
-            ])
-
-        # Update last cumulative steps for delta fallback next iter
-        if isinstance(cum_env_steps, int):
-            self._last_cum_env_steps = cum_env_steps
-
-    def log_eval(self, iteration: int, result: Dict[str, Any]):
-        # Pull the evaluation section (present only when an eval was run this iter)
-        eval_sec = result.get("evaluation") or {}
-        er = eval_sec.get("env_runners") or {}
-        k = int(er.get("num_episodes", 0) or 0)
-        if k <= 0:
-            return
-
-        # Team returns and episode length stats (from RLlib's eval env_runners section)
-        eval_return_mean = er.get("episode_return_mean", "")
-        eval_return_min  = er.get("episode_return_min", "")
-        eval_return_max  = er.get("episode_return_max", "")
-        eval_len_mean    = er.get("episode_len_mean", "")
-        eval_len_min     = er.get("episode_len_min", "")
-        eval_len_max     = er.get("episode_len_max", "")
-
-        # Agent-specific return (example: archer_0)
-        agent_means = er.get("agent_episode_returns_mean", {}) or {}
-        eval_return_archer_0 = agent_means.get("archer_0", "")
-
-        # Hist stats: per-episode returns and (optionally) seed IDs; compute std from the list
-        hist = eval_sec.get("hist_stats", {}) or {}
-        ep_returns = hist.get("episode_reward") or hist.get("episode_return") or []
-        if isinstance(ep_returns, list) and len(ep_returns) > 0:
-            try:
-                eval_return_std = float(np.std(ep_returns))
-            except Exception:
-                eval_return_std = ""
-        else:
-            eval_return_std = ""
-        episode_returns_json = json.dumps(ep_returns if isinstance(ep_returns, list) else [])
-        eval_seed_ids_json   = json.dumps(self._extract_eval_seeds(eval_sec))
-
-        # Training env step counters for traceability (lifetime + per-iter delta)
-        cum_env_steps   = self._extract_cum_env_steps(result)
-        delta_env_steps = self._extract_delta_env_steps(result)
-
-        # Append a row that matches the CSV header exactly.
-        with open(self._eval_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                self.run_id, iteration,
-                k,
-                eval_return_mean, eval_return_min, eval_return_max, eval_return_std,
-                eval_len_mean, eval_len_min, eval_len_max,
-                eval_return_archer_0,
-                episode_returns_json, eval_seed_ids_json,
-                cum_env_steps if cum_env_steps is not None else "",
-                delta_env_steps if delta_env_steps is not None else "",
-            ])
-
-    def log_checkpoint(self, iteration: int, result: Dict[str, Any], ckpt_path: str):
-        cum_env_steps = self._extract_cum_env_steps(result)
-        with open(self._ckpt_csv, "a", newline="") as f:
-            csv.writer(f).writerow([
-                self.run_id, iteration, ckpt_path,
-                cum_env_steps if cum_env_steps is not None else ""
-            ])
-
-    @property
-    def run_dir(self) -> str:
-        return self.dir
+from run_logger import RunLogger
 
 # Constants for evaluation
 
@@ -324,20 +56,6 @@ EVAL_SEEDS = list(range(10_000, 10_000 + 200))  # plenty to cover multiple eval 
 # Evaluation cadence and size (K)
 EVAL_INTERVAL_ITERS = 5
 EVAL_EPISODES_PER_CHECKPOINT = 20  # K
-
-
-
-class CustomWrapper(BaseWrapper):
-    def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
-
-    def observe(self, agent: AgentID) -> ObsType | None:
-        obs = super().observe(agent)
-        if obs is None:
-            return None
-        flat_obs = obs.flatten().astype(np.float32, copy=False)
-        return flat_obs
-
 
 class CustomPredictFunction(Callable):
     """
@@ -358,25 +76,47 @@ class CustomPredictFunction(Callable):
 
 
 
-def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
-    """
-    mode: "train" or "eval"
-    - Both modes use the same wrappers (StickyActionWrapper + CustomWrapper),
-      but cycle through different seed pools via SeedCycleWrapper.
-    """
-    base = create_environment(num_agents=num_agents, visual_observation=visual_observation)
-    base = StickyActionWrapper(base, p_sticky=0.25)   # same stochasticity in both train & eval
-    base = CustomWrapper(base)
+def make_env(
+    mode: str,
+    num_agents: int = 1,
+    visual_observation: bool = False,
+    max_zombies: int = 4,
+    filter_zombies: bool = False,
+    angular_features: bool = False,
+    survival_bonus: bool = False,
+    p_sticky: float = 0.25,
+    survival_reward: float = 0.02,
+):
+    w = create_environment(
+        num_agents=num_agents,
+        visual_observation=visual_observation,
+        max_zombies=max_zombies,
+    )
+
+
+    w = StickyActionWrapper(w, p_sticky=p_sticky)
+
+    if filter_zombies and max_zombies > 0:
+        if angular_features:
+            w = AngularZombieWrapper(w, k=max_zombies)
+        else:
+            w = OnlyZombiesWrapper(w, k=max_zombies)
+    else:
+        w = FlattenWrapper(w)
+
+    if survival_bonus:
+        w = SurvivalBonusAECWrapper(w, archer_id="archer_0", survival_reward=survival_reward)
 
     if mode == "train":
-        base = SeedCycleWrapper(base, seed_list=TRAIN_SEEDS)
+        w = SeedCycleWrapper(w, seed_list=TRAIN_SEEDS)
     elif mode == "eval":
-        base = SeedCycleWrapper(base, seed_list=EVAL_SEEDS)
+        w = SeedCycleWrapper(w, seed_list=EVAL_SEEDS)
     else:
         raise ValueError(f"Unknown env mode: {mode}")
 
-    # RLlib needs a ParallelPettingZooEnv wrapper
-    return ParallelPettingZooEnv(pettingzoo.utils.conversions.aec_to_parallel(base))
+    from pettingzoo.utils.conversions import aec_to_parallel
+    from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
+    return ParallelPettingZooEnv(aec_to_parallel(w))
 
 
 
@@ -400,7 +140,7 @@ def algo_config(env_id: str, policies, policies_to_train):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=policies_to_train,
         )
-        .rl_module(model_config={"fcnet_hiddens": [64, 64]})
+        .rl_module(model_config={"fcnet_hiddens": [256, 256]})
         .training(
             lr=1e-4,
             gamma=0.99,
@@ -413,10 +153,8 @@ def algo_config(env_id: str, policies, policies_to_train):
                 "_enable_replay_buffer_api": True,
                 "type": "MultiAgentEpisodeReplayBuffer",
                 "capacity": 100_000,  #  original capacity
-                "replay_sequence_length": 1,  # non-recurrent DQN
+                "replay_sequence_length": 1,  # nonrecurrent DQN
             },
-            # n_step default = 1
-            epsilon=[[0, 1.0], [200_000, 0.01]],
         )
         # Built-in evaluation
         .evaluation(
@@ -439,16 +177,19 @@ def algo_config(env_id: str, policies, policies_to_train):
 
     return cfg
 
-
-# ---------------------------
-# Training loop
-# ---------------------------
-
 def training(checkpoint_path: str, max_iterations: int = 500):
     env_id = "knights_archers_zombies_v10"
-    register_env(env_id, lambda cfg: make_env(mode=cfg.get("mode", "train")))
+    register_env(env_id,
+                 lambda cfg: make_env(mode=cfg.get("mode", "train"),
+                                      num_agents=1,
+                                      visual_observation=False,
+                                      max_zombies=4,
+                                      angular_features=True,
+                                      survival_bonus=False,
+                                      survival_reward=0,
+                                      p_sticky=0.25))
 
-    # Global seed (per-run)
+    # Global seed
     np.random.seed(GLOBAL_SEED)
     torch.manual_seed(GLOBAL_SEED)
 
@@ -466,7 +207,7 @@ def training(checkpoint_path: str, max_iterations: int = 500):
         "eval_episodes_per_checkpoint": EVAL_EPISODES_PER_CHECKPOINT,
         "eval_interval_iters": EVAL_INTERVAL_ITERS,
         "sticky_action_p": 0.25,
-        "model": "MLP(64,64)",
+        "model": "MLP(256,256)",
         "double_q": False,
         "dueling": False,
         "distributional": False,
@@ -480,7 +221,7 @@ def training(checkpoint_path: str, max_iterations: int = 500):
     logger = RunLogger(
         base_dir=str(Path("results").resolve()),
         global_seed=GLOBAL_SEED,
-        algo_name="DQN",
+        algo_name="DQN_BASE",
         meta=meta,
     )
 
@@ -500,11 +241,6 @@ def training(checkpoint_path: str, max_iterations: int = 500):
             mean_archer = (er.get("agent_episode_returns_mean") or {}).get("archer_0")
             print(f"[seed={GLOBAL_SEED}] iter={i} EVAL: archer_0_mean={mean_archer} over {k_episodes} episodes")
             logger.log_eval(i, result)
-
-        #if train_metrics and "archer_0" in train_metrics:
-        #    if train_metrics["archer_0"] > 5:
-        #        print(f"[seed={GLOBAL_SEED}] Early stop at iter={i} (archer_0 > 5).")
-        #        break
 
         if i % 5 == 0:
             save_result = algo.save(checkpoint_path)

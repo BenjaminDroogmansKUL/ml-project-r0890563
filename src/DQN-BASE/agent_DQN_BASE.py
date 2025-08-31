@@ -24,24 +24,37 @@ from pettingzoo.utils.env import AgentID, ObsType
 from ray.rllib.core.rl_module import MultiRLModule
 
 from sticky_wrapper import StickyActionWrapper
+from angular_zombie_wrapper import AngularZombieWrapper
+from only_zombies_wrapper import OnlyZombiesWrapper
+from flatten_wrapper import FlattenWrapper
+
+
+USE_ANGULAR = False
+K_ZOMBIES   = None
 
 class CustomWrapper(BaseWrapper):
-    """Flattens the symbolic vector state of the environment.
+    def __init__(self, env):
+        super().__init__(env)
+        w = env
+        w = StickyActionWrapper(w, p_sticky=0.25)
+        if K_ZOMBIES:
+            if USE_ANGULAR:
+                w = AngularZombieWrapper(w,K_ZOMBIES)
+            else:
+                w = OnlyZombiesWrapper(w,K_ZOMBIES)
+        else: w = FlattenWrapper(w)
 
-    IMPORTANT: Use the same (or a consistent) wrapper as in training.
-    """
+        self.env = w
 
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
+        return self.env.observation_space(agent)
 
     def observe(self, agent: AgentID) -> Optional[ObsType]:
-        obs = super().observe(agent)
-        flat_obs = obs.flatten()
-        return flat_obs
+        return self.env.observe(agent)
 
 
 class CustomPredictFunction:
-    """Loads a trained DQN MultiRLModule and returns greedy actions via argmax(Q)."""
+    """Loads a trained DQN MultiRLModule and returns action."""
 
     def __init__(self, env):
         package_directory = Path(__file__).resolve().parent
@@ -69,7 +82,6 @@ class CustomPredictFunction:
 
         with torch.no_grad():
             fwd_out = rl_module.forward_inference({"obs": obs_tensor})
-            q_values = fwd_out["q_values"]
-            action = int(torch.argmax(q_values, dim=1).item())
+            action = int(fwd_out["actions"])
 
         return action

@@ -312,7 +312,7 @@ class RunLogger:
 
 # Choose your N external run seeds (you will pass these in one-by-one as GLOBAL_SEED).
 # Example you can use: [111, 222, 333, 444, 555]
-GLOBAL_SEED = 111  # <-- change per run (N=5 runs total)
+GLOBAL_SEED = 333  # <-- change per run (N=5 runs total)
 
 # TRAIN seeds (cycled by SeedCycleWrapper during training).
 TRAIN_SEEDS = list(range(0, 1000))
@@ -335,8 +335,8 @@ PER_EPS = 1e-6           #  epsilon added  priorities
 
 # D4 over D3, distributional
 D4_NUM_ATOMS = 51
-D4_V_MIN = -20.0
-D4_V_MAX =  20.0
+D4_V_MIN = -200.0
+D4_V_MAX =  200.0
 
 
 

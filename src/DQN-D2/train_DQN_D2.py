@@ -312,7 +312,7 @@ class RunLogger:
 
 # Choose your N external run seeds (you will pass these in one-by-one as GLOBAL_SEED).
 # Example you can use: [111, 222, 333, 444, 555]
-GLOBAL_SEED = 111  # <-- change per run (N=5 runs total)
+GLOBAL_SEED = 555  # <-- change per run (N=5 runs total)
 
 # TRAIN seeds (cycled by SeedCycleWrapper during training).
 TRAIN_SEEDS = list(range(0, 1000))
@@ -331,13 +331,23 @@ D1_N_STEP = 3
 
 class CustomWrapper(BaseWrapper):
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
+        # New obs is 5 rows x 5 cols = 25 long when flattened
+        base_space = super().observation_space(agent)
+        sub_space = spaces.Box(low=base_space.low.min(),
+                               high=base_space.high.max(),
+                               shape=(25,),
+                               dtype=np.float32)
+        return sub_space
 
     def observe(self, agent: AgentID) -> ObsType | None:
         obs = super().observe(agent)
         if obs is None:
             return None
-        flat_obs = obs.flatten().astype(np.float32, copy=False)
+
+        # Keep only first row (archer) + last 4 rows (zombies)
+        obs = obs[[0, -4, -3, -2, -1], :]   # shape (5,5)
+
+        flat_obs = obs.flatten().astype(np.float32, copy=False)  # shape (25,)
         return flat_obs
 
 
@@ -402,7 +412,7 @@ def algo_config(env_id: str, policies, policies_to_train):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=policies_to_train,
         )
-        .rl_module(model_config={"fcnet_hiddens": [64, 64]})
+        .rl_module(model_config={"fcnet_hiddens": [128, 128]}) #Try bigger nets
         .training(
             lr=1e-4,
             gamma=0.99,
@@ -416,7 +426,7 @@ def algo_config(env_id: str, policies, policies_to_train):
                 "_enable_replay_buffer_api": True,
                 "type": "MultiAgentEpisodeReplayBuffer",
                 "capacity": 100_000,  #  original capacity
-                "replay_sequence_length": 1,  # non-recurrent DQN
+                #"replay_sequence_length": 1,  # non-recurrent DQN
             },
             # n_step default = 1
             epsilon=[[0, 1.0], [200_000, 0.01]],
@@ -447,7 +457,7 @@ def algo_config(env_id: str, policies, policies_to_train):
 # Training loop
 # ---------------------------
 
-def training(checkpoint_path: str, max_iterations: int = 500):
+def training(checkpoint_path: str, max_iterations: int = 1000):
     env_id = "knights_archers_zombies_v10"
     register_env(env_id, lambda cfg: make_env(mode=cfg.get("mode", "train")))
 
@@ -519,4 +529,4 @@ def training(checkpoint_path: str, max_iterations: int = 500):
 
 if __name__ == "__main__":
     checkpoint_path = str(Path("results").resolve())
-    training(checkpoint_path, max_iterations=500)
+    training(checkpoint_path, max_iterations=5000)

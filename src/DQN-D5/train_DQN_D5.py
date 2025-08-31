@@ -34,6 +34,9 @@ from utils import create_environment
 from sticky_wrapper import StickyActionWrapper
 from seed_cycle_wrapper import SeedCycleWrapper
 
+import supersuit as ss
+
+
 import csv, json, os, time, datetime
 from typing import Dict, Any, List, Optional
 
@@ -312,7 +315,7 @@ class RunLogger:
 
 # Choose your N external run seeds (you will pass these in one-by-one as GLOBAL_SEED).
 # Example you can use: [111, 222, 333, 444, 555]
-GLOBAL_SEED = 111  # <-- change per run (N=5 runs total)
+GLOBAL_SEED = 222  # <-- change per run (N=5 runs total)
 
 # TRAIN seeds (cycled by SeedCycleWrapper during training).
 TRAIN_SEEDS = list(range(0, 1000))
@@ -343,26 +346,95 @@ FULL_DUELING = True          # turn dueling streams ON
 FULL_USE_LSTM = True         # set to False if you want a non-recurrent "full" ablation
 
 # LSTM (only used if FULL_USE_LSTM=True)
-FULL_LSTM_CELL_SIZE = 128
+FULL_LSTM_CELL_SIZE = 128    #drastically smaller
 FULL_LSTM_USE_PREV_ACTION = True
 FULL_LSTM_USE_PREV_REWARD = True
-FULL_REPLAY_SEQUENCE_LENGTH = 20     # length of sequences sampled from the buffer
+FULL_REPLAY_SEQUENCE_LENGTH = 40     # length of sequences sampled from the buffer
 FULL_REPLAY_BURN_IN = 10             # prefix timesteps used to warm the hidden state
 
 # (we reuse your existing D4 settings for num_atoms/v_min/v_max and D1’s n_step)
 
 
+class AngularK4LastRowsKeepShapeAECWrapper(BaseWrapper):
+    """
+    Keep shape exactly 5x5 (flattened to 25):
+      Row 0 (archer) unchanged: [x, y, ?, hx, hy]
+      Rows 1..4 = last 4 rows of raw obs, treated as zombies:
+          [dist, dx, dy, cosΔ, sinΔ]
+    If a 'zombie' row is actually empty (all zeros), we keep zeros (no fake angles).
+    """
+
+    def observation_space(self, agent):
+        base_space = super().observation_space(agent)  # assume Box(*, 5)
+        low = float(np.min(base_space.low))
+        high = float(np.max(base_space.high))
+        return spaces.Box(low=low, high=high, shape=(25,), dtype=np.float32)
+
+    @staticmethod
+    def _unit(v):
+        v = np.asarray(v, dtype=np.float32)
+        n = np.linalg.norm(v)
+        return v / n if n > 1e-8 else np.array([1.0, 0.0], dtype=np.float32)
+
+    def observe(self, agent):
+        raw = super().observe(agent)
+        if raw is None:
+            return None
+        raw = np.asarray(raw, dtype=np.float32)
+
+        # Expect matrix with 5 columns. If flat, reshape.
+        if raw.ndim == 1:
+            assert raw.size % 5 == 0, f"Unexpected flat obs size {raw.size}"
+            raw = raw.reshape((-1, 5))
+
+        # Row 0: archer unchanged
+        archer = raw[0].copy()  # [x, y, ?, hx, hy]
+        hx, hy = archer[3], archer[4]
+        h = self._unit([hx, hy])
+
+        # Take the **last 4 rows**, exactly like your original wrapper
+        zsrc = raw[-4:].copy()  # shape (4, 5)
+
+        # Build zombie rows: replace last two cols with [cosΔ, sinΔ]
+        z_rows = []
+        for i in range(4):
+            dist, dx, dy = zsrc[i, 0], zsrc[i, 1], zsrc[i, 2]
+            if dist == 0.0 and dx == 0.0 and dy == 0.0:
+                # empty slot -> keep all zeros
+                z_rows.append(np.zeros(5, dtype=np.float32))
+            else:
+                vhat = self._unit([dx, dy])
+                cos_d = float(h @ vhat)
+                sin_d = float(h[0]*vhat[1] - h[1]*vhat[0])
+                z_rows.append(np.array([dist, dx, dy, cos_d, sin_d], dtype=np.float32))
+
+        final = np.vstack([archer.reshape(1, 5)] + z_rows)  # (5,5)
+        out = final.flatten().astype(np.float32, copy=False)
+
+        # Safety checks (remove after first run)
+        # assert out.shape[0] == 25, out.shape
+        return out
 
 
 class CustomWrapper(BaseWrapper):
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
+        # New obs is 5 rows x 5 cols = 25 long when flattened
+        base_space = super().observation_space(agent)
+        sub_space = spaces.Box(low=base_space.low.min(),
+                               high=base_space.high.max(),
+                               shape=(25,),
+                               dtype=np.float32)
+        return sub_space
 
     def observe(self, agent: AgentID) -> ObsType | None:
         obs = super().observe(agent)
         if obs is None:
             return None
-        flat_obs = obs.flatten().astype(np.float32, copy=False)
+
+        # Keep only first row (archer) + last 4 rows (zombies)
+        obs = obs[[0, -4, -3, -2, -1], :]   # shape (5,5)
+
+        flat_obs = obs.flatten().astype(np.float32, copy=False)  # shape (25,)
         return flat_obs
 
 
@@ -386,15 +458,17 @@ class CustomPredictFunction(Callable):
 
 
 def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
-    """
-    mode: "train" or "eval"
-    - Both modes use the same wrappers (StickyActionWrapper + CustomWrapper),
-      but cycle through different seed pools via SeedCycleWrapper.
-    """
     base = create_environment(num_agents=num_agents, visual_observation=visual_observation)
-    base = StickyActionWrapper(base, p_sticky=0.25)   # same stochasticity in both train & eval
-    base = CustomWrapper(base)
+    # (Optional but recommended) keep agent set constant for vectorized training:
+    base = ss.black_death_v3(base)
 
+    # Keep your sticky action stochasticity if you like
+    base = StickyActionWrapper(base, p_sticky=0.25)
+
+    # >>> Replace your CustomWrapper with the angular one <<<
+    base = AngularK4LastRowsKeepShapeAECWrapper(base)
+
+    # Seeds, etc.
     if mode == "train":
         base = SeedCycleWrapper(base, seed_list=TRAIN_SEEDS)
     elif mode == "eval":
@@ -402,8 +476,10 @@ def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
     else:
         raise ValueError(f"Unknown env mode: {mode}")
 
-    # RLlib needs a ParallelPettingZooEnv wrapper
-    return ParallelPettingZooEnv(pettingzoo.utils.conversions.aec_to_parallel(base))
+    # Convert AEC → parallel for RLlib
+    from pettingzoo.utils.conversions import aec_to_parallel
+    from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
+    return ParallelPettingZooEnv(aec_to_parallel(base))
 
 
 
@@ -413,7 +489,7 @@ def algo_config(env_id: str, policies, policies_to_train):
     """
 
     model_cfg = {
-        "fcnet_hiddens": [64, 64],
+        "fcnet_hiddens": [128],
     }
 
     if FULL_USE_LSTM:
@@ -433,7 +509,8 @@ def algo_config(env_id: str, policies, policies_to_train):
         )
         .environment(env=env_id, disable_env_checking=True, env_config={"mode": "train"})
         .env_runners(
-            num_env_runners=1,
+            num_env_runners=4,
+            num_envs_per_env_runner=4,
             rollout_fragment_length=64  # simple at first
         )
         .multi_agent(
@@ -441,11 +518,11 @@ def algo_config(env_id: str, policies, policies_to_train):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=policies_to_train,
         )
-        .rl_module(model_config={"fcnet_hiddens": [64, 64]})
+        .rl_module(model_config={"fcnet_hiddens": [256,128,128]}) #try a big bigger
         .training(
             lr=1e-4,
-            gamma=0.99,
-            train_batch_size=256,
+            gamma=0.98,
+            train_batch_size=1024, #massively increase
             num_steps_sampled_before_learning_starts=5_000,
             target_network_update_freq=1000,
             double_q=True, # Improvement over D1
@@ -466,7 +543,7 @@ def algo_config(env_id: str, policies, policies_to_train):
             grad_clip= 40.0,
 
             # n_step default = 1
-            epsilon=[[0, 1.0], [200_000, 0.01]],
+            #epsilon=[[0, 1.0], [200_000, 0.01]],
         )
         # Built-in evaluation
         .evaluation(
@@ -574,4 +651,4 @@ def training(checkpoint_path: str, max_iterations: int = 500):
 
 if __name__ == "__main__":
     checkpoint_path = str(Path("results").resolve())
-    training(checkpoint_path, max_iterations=500)
+    training(checkpoint_path, max_iterations=20000)

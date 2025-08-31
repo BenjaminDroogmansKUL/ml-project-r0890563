@@ -34,6 +34,9 @@ from utils import create_environment
 from sticky_wrapper import StickyActionWrapper
 from seed_cycle_wrapper import SeedCycleWrapper
 
+from pettingzoo.utils.wrappers import BaseParallelWrapper
+
+
 import csv, json, os, time, datetime
 from typing import Dict, Any, List, Optional
 
@@ -312,7 +315,7 @@ class RunLogger:
 
 # Choose your N external run seeds (you will pass these in one-by-one as GLOBAL_SEED).
 # Example you can use: [111, 222, 333, 444, 555]
-GLOBAL_SEED = 111  # <-- change per run (N=5 runs total)
+GLOBAL_SEED = 444  # <-- change per run (N=5 runs total)
 
 # TRAIN seeds (cycled by SeedCycleWrapper during training).
 TRAIN_SEEDS = list(range(0, 1000))
@@ -334,35 +337,61 @@ PER_BETA = 0.4
 PER_EPS = 1e-6           #  epsilon added  priorities
 
 
+class SurvivalBonusWrapper(BaseParallelWrapper): #try adding bonus to stay alive
+    def __init__(self, env, archer_id: str, survival_reward: float = 0.01):
+        super().__init__(env)
+        self.archer_id = archer_id
+        self.survival_reward = survival_reward
+
+    def step(self, actions):
+        obs, rewards, terminations, truncations, infos = self.env.step(actions)
+
+        # If archer is still alive this step, add a bonus
+        if not terminations.get(self.archer_id, False) and not truncations.get(self.archer_id, False):
+            rewards[self.archer_id] = rewards.get(self.archer_id, 0.0) + self.survival_reward
+
+        return obs, rewards, terminations, truncations, infos
+
+class SurvivalBonusAECWrapper(BaseWrapper):
+    def __init__(self, env, archer_id: str, survival_reward: float = 0.02):
+        super().__init__(env)
+        self.archer_id = archer_id
+        self.survival_reward = survival_reward
+
+    def step(self, action):
+        super().step(action)
+
+        # Only modify rewards if archer is still in the game
+        if (
+            self.archer_id in self.env.agents
+            and not self.env.terminations.get(self.archer_id, False)
+            and not self.env.truncations.get(self.archer_id, False)
+        ):
+            self.env.rewards[self.archer_id] = (
+                self.env.rewards.get(self.archer_id, 0.0) ** (1+ self.survival_reward)
+            )
+
 
 class CustomWrapper(BaseWrapper):
     def observation_space(self, agent: AgentID) -> gymnasium.spaces.Space:
-        return spaces.flatten_space(super().observation_space(agent))
+        # New obs is 5 rows x 5 cols = 25 long when flattened
+        base_space = super().observation_space(agent)
+        sub_space = spaces.Box(low=base_space.low.min(),
+                               high=base_space.high.max(),
+                               shape=(25,),
+                               dtype=np.float32)
+        return sub_space
 
     def observe(self, agent: AgentID) -> ObsType | None:
         obs = super().observe(agent)
         if obs is None:
             return None
-        flat_obs = obs.flatten().astype(np.float32, copy=False)
+
+        # Keep only first row (archer) + last 4 rows (zombies)
+        obs = obs[[0, -4, -3, -2, -1], :]   # shape (5,5)
+
+        flat_obs = obs.flatten().astype(np.float32, copy=False)  # shape (25,)
         return flat_obs
-
-
-class CustomPredictFunction(Callable):
-    """
-    Loads RLlib MultiRLModule checkpoint and selects greedy actions via argmax(Q).
-    """
-
-    def __init__(self, env):
-        best_checkpoint = (Path("results") / "learner_group" / "learner" / "rl_module").resolve()
-        self.modules = MultiRLModule.from_checkpoint(best_checkpoint)
-
-    def __call__(self, observation, agent, *args, **kwargs):
-        rl_module = self.modules[agent]
-        fwd_ins = {"obs": torch.tensor(observation, dtype=torch.float32).unsqueeze(0)}
-        fwd_out = rl_module.forward_inference(fwd_ins)
-        q_values = fwd_out["q_values"]  # shape: [B, num_actions]
-        action = torch.argmax(q_values, dim=1)[0].item()
-        return action
 
 
 
@@ -384,6 +413,9 @@ def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
         raise ValueError(f"Unknown env mode: {mode}")
 
     # RLlib needs a ParallelPettingZooEnv wrapper
+    base = SurvivalBonusAECWrapper(base, archer_id="archer_0", survival_reward=0.01)
+
+
     return ParallelPettingZooEnv(pettingzoo.utils.conversions.aec_to_parallel(base))
 
 
@@ -408,7 +440,7 @@ def algo_config(env_id: str, policies, policies_to_train):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=policies_to_train,
         )
-        .rl_module(model_config={"fcnet_hiddens": [64, 64]})
+        .rl_module(model_config={"fcnet_hiddens": [256, 256]})
         .training(
             lr=1e-4,
             gamma=0.99,

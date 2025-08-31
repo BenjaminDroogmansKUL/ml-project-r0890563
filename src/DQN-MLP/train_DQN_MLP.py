@@ -40,15 +40,26 @@ import supersuit as ss
 import csv, json, os, time, datetime
 from typing import Dict, Any, List, Optional
 
-def _extract_env_steps(result: Dict[str, Any]) -> Optional[int]:
-    # Try common fields across RLlib new/old summaries
-    return (
-        result.get("env_steps_sampled")
-        or result.get("num_env_steps_sampled")
-        or result.get("timesteps_total")
-        or result.get("counters", {}).get("env_steps_sampled")
-        or result.get("env_runners", {}).get("env_steps_sampled")
-    )
+
+class SurvivalBonusAECWrapper(BaseWrapper):
+    def __init__(self, env, archer_id: str, survival_reward: float = 0.02):
+        super().__init__(env)
+        self.archer_id = archer_id
+        self.survival_reward = survival_reward
+
+    def step(self, action):
+        super().step(action)
+
+        # Only modify rewards if archer is still in the game
+        if (
+            self.archer_id in self.env.agents
+            and not self.env.terminations.get(self.archer_id, False)
+            and not self.env.truncations.get(self.archer_id, False)
+        ):
+            self.env.rewards[self.archer_id] = (
+                self.env.rewards.get(self.archer_id, 0.0) ** (1+ self.survival_reward)
+            )
+
 
 
 class RunLogger:
@@ -346,7 +357,7 @@ FULL_DUELING = True          # turn dueling streams ON
 FULL_USE_LSTM = True         # set to False if you want a non-recurrent "full" ablation
 
 # LSTM (only used if FULL_USE_LSTM=True)
-FULL_LSTM_CELL_SIZE = 96    #drastically smaller
+FULL_LSTM_CELL_SIZE = 128    #drastically smaller
 FULL_LSTM_USE_PREV_ACTION = True
 FULL_LSTM_USE_PREV_REWARD = True
 FULL_REPLAY_SEQUENCE_LENGTH = 32     # length of sequences sampled from the buffer
@@ -355,122 +366,65 @@ FULL_REPLAY_BURN_IN = 10             # prefix timesteps used to warm the hidden 
 # (we reuse your existing D4 settings for num_atoms/v_min/v_max and D1’s n_step)
 
 
-class AngularAugmentAECWrapper(BaseWrapper):
+class AngularK4LastRowsKeepShapeAECWrapper(BaseWrapper):
     """
-    Assumes base obs is a small matrix where:
-      row 0: [archer_x, archer_y, <unused>, hx, hy]
-      zombie rows: [dist, dx, dy, <unused>, <unused>]
-    If your base layout differs, adapt the column indices below.
+    Keep shape exactly 5x5 (flattened to 25):
+      Row 0 (archer) unchanged: [x, y, ?, hx, hy]
+      Rows 1..4 = last 4 rows of raw obs, treated as zombies:
+          [dist, dx, dy, cosΔ, sinΔ]
+    If a 'zombie' row is actually empty (all zeros), we keep zeros (no fake angles).
     """
-    def __init__(self, env, k_nearest=5, coord_scale=200.0):
-        """
-        k_nearest: number of zombies to encode
-        coord_scale: scale used by tanh-normalization for x,y,dx,dy,dist
-        """
-        super().__init__(env)
-        self.k = k_nearest
-        self.scale = float(coord_scale)
-
-        # Archer: [x_tanh, y_tanh, hx, hy] -> 4
-        # Each zombie: [dist_tanh, dx_tanh, dy_tanh, cosΔ, sinΔ, Δθ/π] -> 6
-        self._feat_dim = 4 + self.k * 6
-
-        # Keep obs finite and normalized to [-1, 1]
-        self._obs_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self._feat_dim,), dtype=np.float32
-        )
 
     def observation_space(self, agent):
-        return self._obs_space
+        base_space = super().observation_space(agent)  # assume Box(*, 5)
+        low = float(np.min(base_space.low))
+        high = float(np.max(base_space.high))
+        return spaces.Box(low=low, high=high, shape=(25,), dtype=np.float32)
 
-    # --- helpers ---
-    def _tanh_norm(self, v):
-        return np.tanh(v / self.scale, dtype=np.float32)
-
-    def _safe_unit(self, v):
+    @staticmethod
+    def _unit(v):
+        v = np.asarray(v, dtype=np.float32)
         n = np.linalg.norm(v)
         return v / n if n > 1e-8 else np.array([1.0, 0.0], dtype=np.float32)
 
-    def _build_features(self, raw_obs):
-        """
-        raw_obs expected shape ~ (rows, 5).
-        row 0: archer: [x, y, ?, hx, hy]
-        zombie rows: [dist, dx, dy, ?, ?]
-        """
-        # --- Archer base features ---
-        ax, ay, _, hx, hy = raw_obs[0].astype(np.float32)
-        h = self._safe_unit(np.array([hx, hy], dtype=np.float32))
-
-        # normalize pos; if you know world size, swap tanh for linear scaling
-        archer_feats = np.array([
-            self._tanh_norm(ax),
-            self._tanh_norm(ay),
-            h[0], h[1],
-        ], dtype=np.float32)
-
-        # --- Collect candidate zombie rows ---
-        if raw_obs.shape[0] > 1:
-            zombies = raw_obs[1:]  # everything after row 0
-        else:
-            zombies = np.zeros((0, raw_obs.shape[1]), dtype=np.float32)
-
-        # compute distances from dx, dy (more robust than trusting provided 'dist')
-        if len(zombies) > 0:
-            dx = zombies[:, 1].astype(np.float32)
-            dy = zombies[:, 2].astype(np.float32)
-            d = np.sqrt(dx*dx + dy*dy, dtype=np.float32)
-            order = np.argsort(d)  # nearest first
-            zombies = zombies[order]
-            dx = dx[order]; dy = dy[order]; d = d[order]
-        else:
-            dx = dy = d = np.array([], dtype=np.float32)
-
-        # pad/truncate to k
-        K = self.k
-        if len(d) < K:
-            pad_n = K - len(d)
-            dx = np.concatenate([dx, np.zeros(pad_n, dtype=np.float32)])
-            dy = np.concatenate([dy, np.zeros(pad_n, dtype=np.float32)])
-            d  = np.concatenate([d,  np.zeros(pad_n, dtype=np.float32)])
-        elif len(d) > K:
-            dx = dx[:K]; dy = dy[:K]; d = d[:K]
-
-        # build per-zombie features
-        z_feats = []
-        for i in range(K):
-            v = np.array([dx[i], dy[i]], dtype=np.float32)
-            vhat = self._safe_unit(v)
-            cos_d = float(h @ vhat)
-            # 2D "cross z" for signed angle
-            sin_d = float(h[0]*vhat[1] - h[1]*vhat[0])
-            ang = np.arctan2(sin_d, cos_d) / np.pi  # in (-1, 1]
-
-            z_feats.extend([
-                self._tanh_norm(d[i]),
-                self._tanh_norm(dx[i]),
-                self._tanh_norm(dy[i]),
-                np.float32(cos_d),
-                np.float32(sin_d),
-                np.float32(ang),
-            ])
-
-        return np.concatenate([archer_feats, np.array(z_feats, dtype=np.float32)], axis=0)
-
-    # --- PettingZoo API overrides ---
     def observe(self, agent):
         raw = super().observe(agent)
         if raw is None:
             return None
+        raw = np.asarray(raw, dtype=np.float32)
 
-        # If earlier wrappers already sliced rows/cols, adapt here.
-        # Expecting shape (rows, 5). If it's flat, try to reshape.
-        if raw.ndim == 1 and raw.size % 5 == 0:
+        # Expect matrix with 5 columns. If flat, reshape.
+        if raw.ndim == 1:
+            assert raw.size % 5 == 0, f"Unexpected flat obs size {raw.size}"
             raw = raw.reshape((-1, 5))
-        assert raw.ndim == 2 and raw.shape[1] >= 5, \
-            f"Expected (rows, >=5), got {raw.shape}"
 
-        feats = self._build_features(raw)
-        return feats.astype(np.float32, copy=False)
+        # Row 0: archer unchanged
+        archer = raw[0].copy()  # [x, y, ?, hx, hy]
+        hx, hy = archer[3], archer[4]
+        h = self._unit([hx, hy])
+
+        # Take the **last 4 rows**, exactly like your original wrapper
+        zsrc = raw[-4:].copy()  # shape (4, 5)
+
+        # Build zombie rows: replace last two cols with [cosΔ, sinΔ]
+        z_rows = []
+        for i in range(4):
+            dist, dx, dy = zsrc[i, 0], zsrc[i, 1], zsrc[i, 2]
+            if dist == 0.0 and dx == 0.0 and dy == 0.0:
+                # empty slot -> keep all zeros
+                z_rows.append(np.zeros(5, dtype=np.float32))
+            else:
+                vhat = self._unit([dx, dy])
+                cos_d = float(h @ vhat)
+                sin_d = float(h[0]*vhat[1] - h[1]*vhat[0])
+                z_rows.append(np.array([dist, dx, dy, cos_d, sin_d], dtype=np.float32))
+
+        final = np.vstack([archer.reshape(1, 5)] + z_rows)  # (5,5)
+        out = final.flatten().astype(np.float32, copy=False)
+
+        # Safety checks (remove after first run)
+        # assert out.shape[0] == 25, out.shape
+        return out
 
 
 class CustomWrapper(BaseWrapper):
@@ -523,7 +477,7 @@ def make_env(mode: str, num_agents: int = 1, visual_observation: bool = False):
     base = StickyActionWrapper(base, p_sticky=0.25)
 
     # >>> Replace your CustomWrapper with the angular one <<<
-    base = AngularAugmentAECWrapper(base, k_nearest=5, coord_scale=200.0)
+    base = AngularK4LastRowsKeepShapeAECWrapper(base)
 
     # Seeds, etc.
     if mode == "train":
@@ -575,11 +529,11 @@ def algo_config(env_id: str, policies, policies_to_train):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: agent_id,
             policies_to_train=policies_to_train,
         )
-        .rl_module(model_config={"fcnet_hiddens": [128]})
+        .rl_module(model_config={"fcnet_hiddens": [256,256]}) #try a big bigger
         .training(
             lr=1e-4,
-            gamma=0.99,
-            train_batch_size=16000, #massively increase
+            gamma=0.98,
+            train_batch_size=1024, #massively increase
             num_steps_sampled_before_learning_starts=5_000,
             target_network_update_freq=1000,
             double_q=True, # Improvement over D1
