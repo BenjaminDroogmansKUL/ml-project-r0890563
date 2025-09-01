@@ -1,0 +1,144 @@
+\section{Task 3: Single Archer Reinforcement Learning}
+
+In this task a single archer agent (\texttt{archer\_0}) learns to play the
+\emph{Knights Archers Zombies} (KAZ) environment, implemented in the
+PettingZoo multi-agent reinforcement learning library \cite{pettingzoo2020}.
+The reinforcement learning framework Ray RLlib \cite{liang2018rllib} is used
+to implement and train the agent.
+
+Following the classical foundations of reinforcement learning
+\cite{sutton2018reinforcement}, we investigate two families of algorithms:
+value-based methods (Deep Q-Networks, DQN \cite{mnih2015human}) and
+policy-gradient methods (Proximal Policy Optimization, PPO
+\cite{schulman2017proximal}). Both algorithms are first established as
+minimal, controlled baselines, and then incrementally enhanced with canonical
+improvements documented in the literature. 
+
+A central difficulty in reinforcement learning research is understanding why a
+given agent succeeds or fails. To address this, we adopt strict evaluation
+protocols following Machado et al. \cite{machado2018revisiting}, including
+the use of sticky actions to prevent brittle open-loop policies, disjoint
+training and evaluation seed sets, multi-seed evaluation, and fixed
+environment-interaction budgets. All experiments are run with a fixed seed per
+configuration, each evaluated on $K=20$ episodes at regular checkpoints,
+reporting mean returns. Performance is compared using
+metrics such as final average return, area under the learning curve (AUC).
+
+\subsection{Neural Network Size}
+A crucial parameter in Deep learning is the size of the model. KAZ is a complicated game with subtle shooting mechanics combined with overal strategy and movement. The amount of features in the observation are however limited. Two hidden layers suffice to learn the features of vectorized observations like in our KAZ setup. The with of the hidden layers then decides the complexity of the model. A wide neural network will have a higher representational capacity and can make the learning more stable or smooth, yet it will be expensive to train and could be prone to overfitting, although the variation in the learning episodes will likely make it so that this is not a problem. A model that is too small will fail to understand the complex mechanics of targeting and shooting zombies and would fall back to cheap repetitive strategies, like failing to shoot at the lowest zombie. An experiment with an appropriate simple but effective learning algorithm compares three neural network sizes. (64,64) vs (128,128) vs (256,256) vs (512,512).
+
+\subsubsection{Results}
+The small neural network seems to be able to represent a sufficently sophisticated strategy. It learned to aim and shoot within less environment steps then the more complicated models. The more complicated models seem to learn either really slowly or fail to generalize. For KAZ two hidden layers with width 64 is the best approximator.
+
+\subsection{Feature Engineering}
+Feature engineering refers to the process of transforming raw observations into
+more informative inputs that make learning easier for the agent. In reinforcement
+learning, compact and well-designed observations can significantly reduce sample
+complexity and improve generalization. For example, reducing the observation space
+to only essential features often leads to more stable learning compared to using
+large, noisy state vectors \cite{rauber2017hindsight}. In the KAZ case, we hypothesize
+that replacing redundant heading vectors with alignment error vectors provides a
+more direct learning signal for aiming tasks.
+
+\subsection{Reward Shaping}
+Reward shaping is the practice of modifying the environment's reward signal to
+make it more informative and easier for the agent to learn from, while ideally
+not changing the optimal policy \cite{ng1999policy}. In sparse-reward environments
+such as KAZ, reward shaping can provide intermediate feedback that guides learning
+towards useful behaviors. A particularly relevant example is survival-based reward
+shaping: giving the agent a small positive reward for every timestep it remains
+alive. This can encourage the agent to adopt evasive and strategic movement
+patterns, rather than relying solely on killing zombies for reward.
+
+
+\subsection{PPO Learning}
+
+Proximal Policy Optimization (PPO) \cite{schulman2017proximal} is a popular
+policy-gradient method that strikes a balance between stability and simplicity.
+It constrains policy updates through a clipped objective, preventing destructive
+large updates that could destabilize training. PPO generally achieves higher
+sample efficiency and stability compared to vanilla policy gradient methods,
+while avoiding the complexity of trust-region approaches such as TRPO. Its
+robustness and ease of implementation make it one of the default choices for
+continuous and discrete control tasks.
+
+A practical advantage is that PPO is directly supported in \texttt{Ray RLlib},
+with highly optimized implementations and configuration options available in
+the official documentation\footnote{\url{https://docs.ray.io/en/latest/rllib/rllib-algorithms.html}}.
+
+
+\subsection{Incremental PPO Evolution}
+
+Starting from a plain PPO baseline with a simple MLP policy network, we
+systematically introduce enhancements motivated by prior work on stabilizing
+policy-gradient methods \cite{arulkumaran2017deep}. The incremental path is:
+
+\begin{enumerate}
+    \item \textbf{BASE} minimal PPO (no entropy bonus, no KL control, no observation normalization).
+    \item \textbf{P1}  add entropy regularization to improve exploration.
+    \item \textbf{P2}  add KL divergence control to stabilize policy updates.
+    \item \textbf{P3}  apply gradient-norm clipping to mitigate instability.
+    \item \textbf{P4}  increase GAE $\lambda$ from 0.95 to 0.98 to improve long-horizon credit assignment.
+\end{enumerate}
+
+\subsection{DQN Learning}
+
+Deep Q-Networks (DQN) \cite{mnih2015human} extend traditional Q-learning to
+high-dimensional state spaces by using a neural network to approximate the
+action-value function. DQN introduced key innovations such as the use of an
+experience replay buffer to decorrelate samples and a target network to
+stabilize bootstrapping updates. Compared to policy-gradient methods, DQN is
+value-based and often more sample efficient in discrete action spaces. While
+extensions such as Double-DQN, Dueling architectures, and Prioritized Replay
+have become standard, even the plain DQN baseline provides a strong foundation
+for discrete-control tasks. 
+
+Similar to PPO, DQN is straightforward to implement in \texttt{Ray RLlib},
+which offers modular agents, replay buffers, and policy definitions. The
+reference implementation is available in the official RLlib algorithms
+documentation\footnote{\url{https://docs.ray.io/en/latest/rllib/rllib-algorithms.html}}.
+\subsection{Incremental DQN Evolution}
+
+A similar stepwise methodology is applied to DQN, starting from a minimal
+baseline and progressively enabling improvements well-documented in the
+literature \cite{mnih2015human, vanhasselt2016double, wang2016dueling,
+schaul2015prioritized, bellemare2017distributional}:
+
+\begin{enumerate}
+    \item \textbf{BASE}  plain DQN (uniform replay, $n$-step=1, no Double, no Dueling).
+    \item \textbf{D1}  increase to $n$-step returns ($n=3$).
+    \item \textbf{D2}  enable Double-DQN to reduce overestimation bias.
+    \item \textbf{D3}  add Prioritized Experience Replay (PER).
+    \item \textbf{D4}  introduce Distributional DQN (C51).
+\end{enumerate}
+
+\subsubsection{Results}
+All models were implemented and verified. Sadly, due to time constraints only partial runs were done and no proper experiments could be run to their conclusion. Informally this is what the test runs showed. The base implementation did learn how to properly shoot and play the game. Compared to PPO learning, it needed considerably more environment steps to reach the same level. In general the DQN models also seemed to benefit from using bigger neural networks. Introducing $n$-step in the D1 model was beneficial. Enabling Double-DQN made the learner faster to learn and smoother. Adding a prioritized Replay buffer seemed to kill the ability of the model to learn. This is strange and should be investigated properly. Introducing a distributional DQN improved the learner, but only slightly.
+
+\subsection{LSTM Networks}
+
+Long Short-Term Memory (LSTM) networks \cite{hochreiter1997long} are a
+specialized type of recurrent neural network (RNN) designed to capture
+long-range temporal dependencies in sequential data. Unlike simple RNNs, LSTMs
+mitigate the vanishing and exploding gradient problems by introducing a gating
+mechanism that controls the flow of
+information. This allows LSTMs to retain relevant information over extended
+time horizons, making them particularly effective for partially observable
+environments or tasks where temporal context is essential.
+
+In reinforcement learning, LSTMs are often used to augment policy or value
+networks, enabling agents to integrate information across multiple timesteps
+rather than relying solely on the current observation. This is especially
+useful in settings with incomplete or noisy observations.
+
+As with PPO and DQN, LSTM-based models are directly supported in
+\texttt{Ray RLlib}, which provides recurrent policy templates and utilities for
+sequence batching and hidden state management. Reference implementations are
+documented in the RLlib algorithms guide\footnote{\url{https://docs.ray.io/en/latest/rllib/rllib-algorithms.html}}.
+
+Implementations of a RRN in using both PPO and DQN are part of the source github. Due to time constraints, only informal results could be retrieved. The models did exhibit more deliberate strategy. The archer would occasionally move to catch a zombie that was near to the border. For both the DQN implementation and PPO implementation, it took much longer to train. Getting the parameters right was also more tricky. For the KAZ game in single player mode, I think it might be better to stick with simple models. 
+
+\subsection{Conclusion}
+Our experimentation tells us a couple things. KAZ is a complex games which can be learned using deep learning. When using vectorized observations a small neural network suffices to learn the game. Ray RLlib has readily available implementations for both DQN learning algorithms and PPO algorithms. For KAZ, PPO learning seems to outperform DQN learning. Reward shaping can be used to incentivise an agent to learn quicker by stimulating the actual desired behavior. Limiting the observation space is a good idea and helps simpler models to learn faster. Adding angular offsets to an aiming task makes learning easier. 
+
+LSTM models are interesting, but harder to setup and more expensive to train. For KAZ the complexity might outweight the benefit.

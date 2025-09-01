@@ -1,2 +1,34 @@
 \section{Introduction}
-This is a placeholder section. Replace with your project content, structure, and results.
+Machine learning is one of the most active and innovative research fields today. Outside of the big theoretic advancements, a lot of practical applications find their way into the world. In practical settings two aspects often arise. Often the state space is enourmous, so that that an approximate solution is the only option. This gives rise to Deep learning where Neural Networks (NN) are used to approximate complicated state-action functions. In the real world we are often not alone. This gives rise to the second common aspect to Machine Learning problems. Entire research fields exist to study what happens when multiple actors want to achieve something simultaneously. Games are often used in research for both deep learning and agent interactions. Games are useful in this setting, because it is easy to control the environment and understand the results. They do have the power to capture delicate interactions and because of combinatorial explosion they can become quite complex. 
+
+Task 1 is an overview of the works which are the base of our experiments. In our work we study the interaction between the fields which have studied agent interactions in task 2. Then we train a single agent to learn a complex game using deep learning in task 3. 
+
+
+\section{Task 1: literature Study}
+
+Three papers were especially influential for this work. Apart from this there is a lot of other material which was important, they are 
+
+\paragraph{Bloembergen et al. (2015).}  
+The survey on \emph{Evolutionary Dynamics of Multi-Agent Learning}
+\cite{bloembergen2015evolutionary} guided \textbf{Task 2 (Matrix Games)}. It
+connected game-theoretic concepts such as Nash equilibria and Pareto
+efficiency with learning dynamics, and introduced replicator equations as a
+tool to analyze how strategies evolve—directly shaping the analytical part of
+the assignment.
+
+\paragraph{Machado et al. (2018).}  
+The study revisiting the Arcade Learning Environment \cite{machado2018revisiting}
+influenced \textbf{Task 3 (Single Archer RL)} by emphasizing robust evaluation
+protocols. Principles such as sticky actions, train-test seed separation, and
+multi-seed evaluation inspired how experiments were designed and assessed.
+
+\paragraph{Arulkumaran et al. (2017).}  
+The brief survey on deep reinforcement learning \cite{arulkumaran2017deep}
+helped frame the \textbf{algorithmic choices in Task 3}. It clarified the tradeoffs
+between DQN and PPO, and highlighted common extensions, motivating the
+incremental improvement path used here.
+
+\paragraph{Summary.}  
+Together, these works provided theoretical grounding for matrix games,
+methodological rigor for evaluation, and practical guidance for algorithm
+design.
